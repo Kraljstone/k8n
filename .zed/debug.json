@@ -1,0 +1,9 @@
+[
+  {
+    "label": "Debug Manager",
+    "adapter": "Delve",
+    "request": "launch",
+    "mode": "debug",
+    "program": "./cmd/manager"
+  }
+]
