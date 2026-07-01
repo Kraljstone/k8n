@@ -7,60 +7,107 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Kraljstone/k8n/internal/api"
+	"github.com/Kraljstone/k8n/internal/model"
 	"github.com/Kraljstone/k8n/internal/runner"
-	"github.com/Kraljstone/k8n/internal/types"
 	"github.com/google/uuid"
 )
 
 func handleHealthCheck() http.HandlerFunc {
-	// Any setup code here runs ONCE when the server boots up.
-
 	return func(w http.ResponseWriter, r *http.Request) {
-		// This code runs on EVERY network request.
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"status": "healthy"}`)
+		fmt.Fprint(w, `{"status":"healthy"}`)
 	}
 }
 
 func (s *Server) handleTaskCreate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var task types.Task
-		if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
+		var req api.CreateTaskRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintf(w, `{"error": "invalid task payload"}`)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid task payload"})
 			return
 		}
 
-		task.ID = uuid.New()
-		task.State = types.Pending
-		task.StartTime = time.Now()
+		task := model.Task{
+			ID:     uuid.New(),
+			Name:   req.Name,
+			State:  model.StatePending,
+			Image:  req.Image,
+			Memory: req.Memory,
+			Disk:   req.Disk,
+		}
 
-		// Save to our server memory map
-		s.mu.Lock()
-		s.tasks[task.ID] = task
-		s.mu.Unlock()
-
+		s.store.CreateTask(task)
 		fmt.Printf("[Manager] Stored Task: %s (ID: %s)\n", task.Name, task.ID)
 
-		// 2. THE LINK: Run the task in the background using 'go'
-		// We use context.Background() here so the task keeps running
-		// even after this specific HTTP request finishes and closes.
-		go func(t types.Task) {
-			err := runner.ExecuteTask(context.Background(), &t)
+		// Try to assign to a worker; fall back to local execution.
+		workers := s.store.ListWorkers()
+		assigned, err := s.scheduler.Assign(task, workers)
+		if err == nil && assigned != nil {
+			// TODO: Dispatch task to assigned worker via HTTP.
+			fmt.Printf("[Manager] Assigned task %s to worker %s\n", task.Name, assigned.Name)
+		} else {
+			// Run locally.
+			go func(t model.Task) {
+				t.State = model.StateRunning
+				s.store.UpdateTask(t)
+				runner.ExecuteTask(context.Background(), &t)
+				s.store.UpdateTask(t)
+			}(task)
+		}
 
-			// 3. Update the task state in our master memory map when it finishes!
-			s.mu.Lock()
-			s.tasks[t.ID] = t
-			s.mu.Unlock()
-
-			if err != nil {
-				fmt.Printf("[Manager] Background task %s failed\n", t.Name)
-			}
-		}(task)
-
-		// Respond to the API client immediately while the task runs in the background
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(task)
+		json.NewEncoder(w).Encode(toTaskResponse(task))
 	}
+}
+
+func (s *Server) handleWorkerRegister() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req api.RegisterWorkerRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid registration payload"})
+			return
+		}
+
+		id := uuid.New()
+		node := model.Node{
+			ID:       id,
+			Name:     req.ID,
+			Address:  req.Address,
+			Role:     model.NodeRoleWorker,
+			State:    model.NodeStateHealthy,
+			LastPing: time.Now(),
+		}
+		s.store.AddWorker(node)
+
+		fmt.Printf("[Manager] Worker registered: %s (ID: %s)\n", req.ID, id)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":    "registered",
+			"worker_id": id.String(),
+		})
+	}
+}
+
+// toTaskResponse converts a model.Task to an API response.
+func toTaskResponse(t model.Task) api.TaskResponse {
+	resp := api.TaskResponse{
+		ID:     t.ID.String(),
+		Name:   t.Name,
+		State:  t.State.String(),
+		Image:  t.Image,
+		Memory: t.Memory,
+		Disk:   t.Disk,
+	}
+	if !t.StartTime.IsZero() {
+		resp.StartTime = t.StartTime.Format(time.RFC3339)
+	}
+	if !t.FinishTime.IsZero() {
+		resp.FinishTime = t.FinishTime.Format(time.RFC3339)
+	}
+	return resp
 }

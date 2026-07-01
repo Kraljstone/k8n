@@ -1,0 +1,9 @@
+__debug_bin*
+*.exe
+*.test
+*.out
+*.tmp
+
+# Only ignore the compiled binaries at the root level!
+/manager
+/worker
